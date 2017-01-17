@@ -2225,4 +2225,143 @@ Repeat User Password:
     ```
 
 #####配置存储节点
+
+此处使用控制节点做为存储节点，在实际的生产中，可以单独使用一个节点或集群作为存储。
+
+1. 安装支持的工具包，并启动服务：
+   
+   ```
+   # yum install lvm2
+   # systemctl enable lvm2-lvmetad.service
+   # systemctl start lvm2-lvmetad.service
+   ```
+
+2. 存储节点需要有单独的存储磁盘来提供数据存储，此处为控制节点新加的一个磁盘sdb,在sdb上创建LVM卷：
+   
+   ```
+   # pvcreate /dev/sdb
+   Physical volume "/dev/sdb" successfully created.
+   ```
+3. 创建 LVM 卷组 cinder-volumes,块存储服务会在这个卷组中创建逻辑卷：
+   
+   ```
+   # vgcreate cinder-volumes /dev/sdb
+   Volume group "cinder-volumes" successfully created
+   ```
+* 编辑`/etc/lvm/lvm.conf`文件，在``devices``部分，添加一个过滤器：
   
+  ```
+  devices {
+
+  filter = [ "a/sdb/", "r/.*/"]
+  ```
+  
+  如果您的存储节点在操作系统磁盘上使用了 LVM，您还必需添加相关的设备到过滤器中。例如，如果 /dev/sda 设备包含操作系统(a 表示`accept`,b表示`reject`)：
+   
+   ```
+   filter = [ "a/sda/", "a/sdb/", "r/.*/"]
+   ```
+
+* 在存储节点安装软件包（此处为控制节点）：
+  
+  ```
+  # yum install openstack-cinder targetcli python-keystone -y
+  ```
+* 编辑 /etc/cinder/cinder.conf，同时完成如下动作（如果控制节点和存储节点是同一节点，此步不用操作）：
+  * 在 [database] 部分，配置数据库访问：
+    
+    ```
+    [database]
+
+    connection = mysql+pymysql://cinder:cinder@172.16.10.31/cinder
+    ```
+  * 在``[DEFAULT]``部分，配置``RabbitMQ``消息队列访问权限：
+    
+    ```
+    [DEFAULT]
+
+    transport_url = rabbit://openstack:openstack@172.16.10.31
+    ```
+  * 在 `[DEFAULT]` 和 `[keystone_authtoken]` 部分，配置认证服务访问：
+    
+    ```
+    [DEFAULT]
+
+    auth_strategy = keystone
+
+    [keystone_authtoken]
+
+	auth_uri = http://172.16.10.31:5000
+	auth_url = http://172.16.10.31:35357
+	memcached_servers = 172.16.10.31:11211
+	auth_type = password
+	project_domain_name = Default
+	user_domain_name = Default
+	project_name = service
+	username = cinder
+	password = cinder
+	```
+  * 配置`iscsi_ip_address`选项为存储节点IP：
+    
+    ```
+    iscsi_ip_address = 172.16.10.31
+    ```
+  * 添加 `[lvm]`区域并加入如下内容：
+    
+    ```
+    [lvm]
+	volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver
+	volume_group = cinder-volumes
+	iscsi_protocol = iscsi
+	iscsi_helper = lioadm
+    ```
+  * 在 [DEFAULT] 部分，启用 LVM 后端：
+    
+    ```
+    [DEFAULT]
+
+    enabled_backends = lvm
+    ```
+  * 在 [DEFAULT] 区域，配置镜像服务 API 的位置：
+    
+    ```
+    [DEFAULT]
+
+    glance_api_servers = http://172.16.10.31:9292
+    ```
+  * 在 [oslo_concurrency] 部分，配置锁路径：
+    
+    ```
+    [oslo_concurrency]
+
+    lock_path = /var/lib/cinder/tmp
+    ```
+* 启动服务
+  
+  ```
+  # systemctl enable openstack-cinder-volume.service target.service
+  # systemctl start openstack-cinder-volume.service target.service
+  ```
+  
+* 验证操作
+  在控制节点查看服务组件是否运行正常
+  
+  ```
+  [root@node1 ~]# source  admin-openstack 
+[root@node1 ~]# openstack volume service list
++------------------+-----------+------+---------+-------+----------------------------+
+| Binary           | Host      | Zone | Status  | State | Updated At                 |
++------------------+-----------+------+---------+-------+----------------------------+
+| cinder-scheduler | node1     | nova | enabled | up    | 2017-01-17T04:53:03.000000 |
+| cinder-volume    | node1@lvm | nova | enabled | up    | 2017-01-17T04:53:04.000000 |
++------------------+-----------+------+---------+-------+----------------------------+
+  ```
+* 使用demo登录Horizon,在管理界面添加卷，连接卷到虚拟机,登录虚拟机，格式化新连接的磁盘vdb。
+  
+  ```
+  sudo mkfs.ext4 /dev/vdb
+  sudo mount /dev/vdb /tmp
+  sudo echo "this file on vdb" >> /tmp/test.txt
+  sudo umount /tmp
+  ```
+* 在管理界面断开此卷，可以尝试将写有内容的此卷连接到其他的虚拟机上，依旧可以读取之前写入的内容。
